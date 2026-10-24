@@ -37,4 +37,4 @@
 - זיהוי טקסט: [Tesseract.js](https://github.com/naptha/tesseract.js) (רישיון Apache-2.0), עם מודלי `heb` ו-`eng` מסוג `best_int`. כל הקבצים נמצאים בתיקייה `vendor/`, כך שאין תלות בשרתים חיצוניים.
 - לפני הזיהוי התמונה עוברת עיבוד מקדים: יישור תאורה כדי לבטל צל, ומתיחת ניגודיות.
 - הקראה: Web Speech API (`speechSynthesis`).
-- אחסון: GitHub Pages, עם workflow שנמצא ב-`.github/workflows/pages.yml`.
+- אחסון: GitHub Pages, ישירות מהענף `main`.
