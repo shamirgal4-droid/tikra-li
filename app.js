@@ -434,7 +434,14 @@ async function fileToCanvas(file) {
   try {
     const img = new Image();
     img.src = url;
-    await img.decode();
+    try {
+      await img.decode();
+    } catch {
+      // HEIC (ברירת המחדל של אייפון) נפתח רק בספארי. בכרום/אנדרואיד – הודעה ברורה
+      throw new Error(/heic|heif/i.test(file.type + file.name)
+        ? 'התמונה בפורמט HEIC של אייפון, והדפדפן הזה לא פותח אותו. פתחו את האפליקציה בספארי, או צלמו דרך "צילום דף"'
+        : 'לא הצלחנו לפתוח את התמונה');
+    }
     const scale = Math.min(1, MAX_IMAGE_SIDE / Math.max(img.naturalWidth, img.naturalHeight));
     const c = document.createElement('canvas');
     c.width = Math.round(img.naturalWidth * scale);
@@ -609,18 +616,32 @@ function removeNikudMarks(src) {
 }
 
 // מוחק קווים ארוכים (טבלאות, שורות למילוי, קו תחתון) – הם מבלבלים את זיהוי הפריסה.
-// קו = ריצה כהה רציפה ארוכה בהרבה מגובה של אות.
+// קו = ריצה כהה רציפה ארוכה בהרבה מגובה של אות. איפה שאות נוגעת בקו (קו תחתון
+// מתחת ל-ן, ל-ק) הפיקסל שייך גם לאות – אותו משאירים, אחרת האות נקטעת.
 function removeLines(d, w, h) {
   const dark = (i) => d[i * 4] < 128;
   const kill = new Uint8Array(w * h);
   const minH = Math.max(60, w * 0.12);
   const minV = Math.max(60, h * 0.035);
+  const maxThick = Math.max(4, Math.round(Math.max(w, h) * 0.003)); // עובי מקסימלי של קו
+  const extentV = (x, y) => {
+    let n = 1;
+    for (let k = y - 1; k >= 0 && dark(k * w + x) && n <= maxThick * 3; k--) n++;
+    for (let k = y + 1; k < h && dark(k * w + x) && n <= maxThick * 3; k++) n++;
+    return n;
+  };
+  const extentH = (x, y) => {
+    let n = 1;
+    for (let k = x - 1; k >= 0 && dark(y * w + k) && n <= maxThick * 3; k--) n++;
+    for (let k = x + 1; k < w && dark(y * w + k) && n <= maxThick * 3; k++) n++;
+    return n;
+  };
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w;) {
       if (!dark(y * w + x)) { x++; continue; }
       let e = x;
       while (e < w && dark(y * w + e)) e++;
-      if (e - x >= minH) for (let k = x; k < e; k++) kill[y * w + k] = 1;
+      if (e - x >= minH) for (let k = x; k < e; k++) if (extentV(k, y) <= maxThick) kill[y * w + k] = 1;
       x = e;
     }
   }
@@ -629,11 +650,11 @@ function removeLines(d, w, h) {
       if (!dark(y * w + x)) { y++; continue; }
       let e = y;
       while (e < h && dark(e * w + x)) e++;
-      if (e - y >= minV) for (let k = y; k < e; k++) kill[k * w + x] = 1;
+      if (e - y >= minV) for (let k = y; k < e; k++) if (extentH(x, k) <= maxThick) kill[k * w + x] = 1;
       y = e;
     }
   }
-  // מוחקים גם פיקסל אחד מסביב – קווים בצילום הם מטושטשים בשוליים
+  // מוחקים גם את השוליים המטושטשים של הקו (פיקסלים אפורים צמודים), אבל לא אותיות
   for (let i = 0; i < kill.length; i++) {
     if (!kill[i]) continue;
     const x = i % w;
@@ -642,9 +663,14 @@ function removeLines(d, w, h) {
       for (let dx = -1; dx <= 1; dx++) {
         const xx = x + dx;
         const yy = y + dy;
-        if (xx >= 0 && xx < w && yy >= 0 && yy < h) {
-          const p = (yy * w + xx) * 4;
-          d[p] = d[p + 1] = d[p + 2] = 255;
+        if (xx < 0 || xx >= w || yy < 0 || yy >= h) continue;
+        const j = yy * w + xx;
+        if (kill[j] || !dark(j) || (extentV(xx, yy) <= maxThick + 1 && extentH(xx, yy) <= maxThick + 1) || dy === 0 || dx === 0) {
+          // נמחק רק אם זה חלק מהקו או שוליים שלו – לא קצה של אות
+          if (kill[j] || d[j * 4] >= 128 || extentV(xx, yy) <= maxThick + 1) {
+            const p = j * 4;
+            d[p] = d[p + 1] = d[p + 2] = 255;
+          }
         }
       }
     }
@@ -660,7 +686,8 @@ function meaningful(line) {
 
 const BIDI_MARKS = /[‎‏‪-‮⁦-⁩]/g;
 const FILL_LINES = /_{2,}|\.{4,}|…{2,}/g;   // שורות ריקות למילוי בדפי עבודה
-const MIN_EDGE_CONF = 45;  // "מילים" לא בטוחות בקצה שורה הן כמעט תמיד לכלוך/צל
+const MIN_EDGE_CONF = 45;
+const MIN_LINE_CONF = 55;  // "מילים" לא בטוחות בקצה שורה הן כמעט תמיד לכלוך/צל
 const LIST_ITEM = /^(?:\d{1,2}[.)]?|[א-ת][.)]|[•●▪◦*\-–])\s/;  // 1. / א. / • – כל סעיף בשורה משלו
 
 const QUOTES = /['"“”„‘’`]/;
@@ -686,6 +713,9 @@ function ocrToText(data) {
       const lines = [];
       for (const line of para.lines || []) {
         const words = line.words.slice();
+        // שורה שכולה בביטחון נמוך היא כמעט תמיד לוגו/ציור/קצה הדף – חוץ ממילה בודדת אמיתית
+        const anchored = words.some((w) => w.confidence >= 80 && (w.text.match(/[\p{L}]/gu) || []).length >= 3);
+        if (line.confidence < MIN_LINE_CONF && !anchored && !(words.length === 1 && keepEdge(words[0]))) continue;
         while (words.length && !keepEdge(words[0])) words.shift();
         while (words.length && !keepEdge(words[words.length - 1])) words.pop();
         const text = words.map((w) => cleanWord(w.text)).filter(Boolean).join(' ');
@@ -755,6 +785,53 @@ function quality(data) {
   return { score, conf: letters ? confSum / letters : 0 };
 }
 const isGood = (r) => r.score >= MIN_GOOD_LETTERS && r.conf >= MIN_GOOD_CONF;
+
+const allLines = (data) => (data.blocks || []).flatMap((b) => (b.paragraphs || []).flatMap((p) => p.lines || []));
+
+// בשורה עברית, "מילה" באנגלית בביטחון לא מלא היא כמעט תמיד מילה עברית שנקראה לא נכון.
+// מחליפים אותה במילה שבאותו מקום בזיהוי בעברית בלבד.
+function fixHebrewWords(mixed, hebOnly) {
+  const hebLines = allLines(hebOnly);
+  const hebWords = hebLines.flatMap((l) => l.words || []);
+  const overlap = (a, b) => {
+    const iw = Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0);
+    const ih = Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0);
+    if (iw <= 0 || ih <= 0) return 0;
+    const area = (r) => (r.x1 - r.x0) * (r.y1 - r.y0);
+    return (iw * ih) / (area(a) + area(b) - iw * ih); // IoU – אותה מילה, לא שכנה
+  };
+  for (const line of allLines(mixed)) {
+    const text = line.words.map((w) => w.text).join(' ');
+    const he = (text.match(HEB_RE) || []).length;
+    const en = (text.match(LAT_RE) || []).length;
+    if (he <= en || !line.words.some((w) => /[A-Za-z]/.test(w.text) && w.confidence < 90)) continue;
+    // כמעט כולה עברית – לוקחים את כל השורה מהזיהוי בעברית (גם סדר המילים שם נכון)
+    if (en < (he + en) * 0.35) {
+      let match = null;
+      let bestOv = 0.5;
+      for (const hl of hebLines) {
+        const ov = overlap(line.bbox, hl.bbox);
+        if (ov > bestOv) { bestOv = ov; match = hl; }
+      }
+      if (match) { line.words = match.words; continue; }
+    }
+    for (const w of line.words) {
+      if (!/[A-Za-z]/.test(w.text) || w.confidence >= 90) continue;
+      let match = null;
+      let bestOv = 0.5;
+      for (const hw of hebWords) {
+        const ov = overlap(w.bbox, hw.bbox);
+        if (ov > bestOv && HAS_HEB.test(hw.text)) { bestOv = ov; match = hw; }
+      }
+      if (match) {
+        w.text = match.text;
+        w.confidence = Math.max(w.confidence, match.confidence);
+      }
+    }
+    // רצף "אנגלי" נשמר בסדר משמאל לימין; אם כולו הוחלף לעברית – מסדרים מימין לשמאל
+    if (!line.words.some((w) => /[A-Za-z]/.test(w.text))) line.words.sort((a, b) => b.bbox.x1 - a.bbox.x1);
+  }
+}
 
 function showPreview(canvas) {
   const preview = $('#preview');
@@ -840,6 +917,13 @@ async function recognizePage(page, { autoRotate = true } = {}) {
       const he = (text.match(HEB_RE) || []).length;
       const en = (text.match(LAT_RE) || []).length;
       const single = he >= (he + en) * 0.9 ? ['heb'] : en >= (he + en) * 0.9 ? ['eng'] : null;
+      if (!single && he >= (he + en) * 0.3) {
+        attempt = 'משפר את העברית…';
+        const wh = await getWorker(['heb']);
+        await wh.setParameters({ tessedit_pageseg_mode: best.psm });
+        const { data } = await wh.recognize(prepare(best.canvas, best.pre, best.marks), {}, { blocks: true, text: true });
+        fixHebrewWords(best.data, data);
+      }
       if (single) {
         attempt = 'משפר את הדיוק…';
         const w1 = await getWorker(single);
@@ -873,7 +957,7 @@ async function handleFiles(files, { append = false } = {}) {
     openReaderFromPages();
   } catch (err) {
     console.error(err);
-    toast(`משהו השתבש בזיהוי. נסו שוב, או צלמו מחדש. (${String(err?.message || err).slice(0, 80)})`, 8000);
+    toast(`משהו השתבש בזיהוי. נסו שוב, או צלמו מחדש. (${String(err?.message || err).slice(0, 160)})`, 10000);
     show(state.text ? 'reader' : 'home');
   }
 }
