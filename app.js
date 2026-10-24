@@ -22,7 +22,7 @@ const store = {
 
 // ─── מצב ─────────────────────────────────────────────────────────────────────
 
-const RATE_MIN = 0.5;
+const RATE_MIN = 0.3;
 const RATE_MAX = 2;
 const RATE_STEP = 0.1;
 const MAX_CHUNK = 180;      // משפטים ארוכים מפוצלים – כרום נתקע על הקראות ארוכות
@@ -364,6 +364,7 @@ function jump(delta) {
 // ─── מהירות ──────────────────────────────────────────────────────────────────
 
 function rateName(r) {
+  if (r < 0.5) return 'הכי איטי';
   if (r < 0.75) return 'איטי מאוד';
   if (r < 0.95) return 'איטי';
   if (r <= 1.05) return 'רגיל';
