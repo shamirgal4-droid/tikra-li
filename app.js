@@ -554,6 +554,60 @@ function preprocess(src) {
   return c;
 }
 
+// כמה סימני ניקוד יש ביחס לאותיות עבריות (בטקסט שזוהה)
+function nikudRatio(text) {
+  const marks = (text.match(/[\u05B0-\u05BC\u05C1\u05C2]/g) || []).length;
+  return marks / Math.max(1, (text.match(/[\u05D0-\u05EA]/g) || []).length);
+}
+
+// מוחק מהתמונה רכיבים קטנים – נקודות וקווקווים של ניקוד. סף הגובה (36% מאות רגילה)
+// נמוך מגובה של י', כך שהאותיות נשארות. (נמחקים גם נקודה ופסיק – מחיר קטן.)
+function removeNikudMarks(src) {
+  const w = src.width;
+  const h = src.height;
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(src, 0, 0);
+  const img = ctx.getImageData(0, 0, w, h);
+  const d = img.data;
+  const dark = (i) => d[i * 4] < 128;
+  const label = new Int32Array(w * h).fill(-1);
+  const comps = [];
+  const stack = [];
+  for (let i = 0; i < w * h; i++) {
+    if (label[i] !== -1 || !dark(i)) continue;
+    const comp = { px: [], minX: w, maxX: 0, minY: h, maxY: 0 };
+    label[i] = comps.length;
+    stack.push(i);
+    while (stack.length) {
+      const p = stack.pop();
+      comp.px.push(p);
+      const x = p % w;
+      const y = (p - x) / w;
+      if (x < comp.minX) comp.minX = x;
+      if (x > comp.maxX) comp.maxX = x;
+      if (y < comp.minY) comp.minY = y;
+      if (y > comp.maxY) comp.maxY = y;
+      if (x > 0 && label[p - 1] === -1 && dark(p - 1)) { label[p - 1] = comps.length; stack.push(p - 1); }
+      if (x < w - 1 && label[p + 1] === -1 && dark(p + 1)) { label[p + 1] = comps.length; stack.push(p + 1); }
+      if (y > 0 && label[p - w] === -1 && dark(p - w)) { label[p - w] = comps.length; stack.push(p - w); }
+      if (y < h - 1 && label[p + w] === -1 && dark(p + w)) { label[p + w] = comps.length; stack.push(p + w); }
+    }
+    comps.push(comp);
+  }
+  const heights = comps.filter((k) => k.px.length > 30).map((k) => k.maxY - k.minY + 1).sort((a, b) => a - b);
+  const letterH = heights[Math.floor(heights.length * 0.6)] || 0;
+  for (const k of comps) {
+    if (k.maxY - k.minY + 1 < letterH * 0.36 && k.maxX - k.minX + 1 < letterH * 0.9) {
+      for (const p of k.px) d[p * 4] = d[p * 4 + 1] = d[p * 4 + 2] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  return c;
+}
+
 // מוחק קווים ארוכים (טבלאות, שורות למילוי, קו תחתון) – הם מבלבלים את זיהוי הפריסה.
 // קו = ריצה כהה רציפה ארוכה בהרבה מגובה של אות.
 function removeLines(d, w, h) {
@@ -611,7 +665,7 @@ const LIST_ITEM = /^(?:\d{1,2}[.)]?|[א-ת][.)]|[•●▪◦*\-–])\s/;  // 1.
 
 const QUOTES = /['"“”„‘’`]/;
 function cleanWord(text) {
-  let t = text.replace(BIDI_MARKS, '').replace(/[|¦]/g, '').replace(FILL_LINES, '').trim();
+  let t = text.replace(BIDI_MARKS, '').replace(NQ_MARKS, '').replace(/[|¦]/g, '').replace(FILL_LINES, '').trim();
   if (!/[\p{L}\p{N}]/u.test(t)) return /^[.,!?;:…-]+$/.test(t) ? t : '';
   // מרכאה פותחת בלי סוגרת היא כמעט תמיד שארית של קו או לכלוך
   if (QUOTES.test(t[0]) && !QUOTES.test(t[t.length - 1])) t = t.slice(1);
@@ -661,6 +715,7 @@ function cleanOcr(text) {
   return text
     .replace(/\r/g, '')
     .replace(BIDI_MARKS, '')
+    .replace(NQ_MARKS, '')
     .replace(FILL_LINES, ' ')
     .split(/\n\s*\n/)
     .map((para) => {
@@ -732,10 +787,14 @@ async function recognizePage(page, { autoRotate = true } = {}) {
   try {
     let worker = await getWorker();
     hint.textContent = '';
-    const run = async (canvas, pre, psm = PSM_AUTO) => {
+    const prepare = (canvas, pre, marks) => {
+      const img = pre ? preprocess(canvas) : canvas;
+      return marks ? removeNikudMarks(img) : img;
+    };
+    const run = async (canvas, pre, psm = PSM_AUTO, marks = false) => {
       await worker.setParameters({ tessedit_pageseg_mode: psm });
-      const { data } = await worker.recognize(pre ? preprocess(canvas) : canvas, {}, { blocks: true, text: true });
-      return { data, canvas, pre, psm, ...quality(data) };
+      const { data } = await worker.recognize(prepare(canvas, pre, marks), {}, { blocks: true, text: true });
+      return { data, canvas, pre, psm, marks, ...quality(data) };
     };
 
     let best = await run(page.canvas, true);
@@ -768,7 +827,15 @@ async function recognizePage(page, { autoRotate = true } = {}) {
         if (isGood(best)) break;
       }
     }
-    if (state.ocrLang === 'mix' && isGood(best)) {
+    // דף מנוקד: הנקודות והקווים מבלבלים את המנוע. מוחקים אותם מהתמונה, קוראים
+    // את האותיות, והנקדן יחזיר את הניקוד אחר כך.
+    page.hadNikud = state.ocrLang !== 'eng' && nikudRatio(best.data.text || '') >= 0.25;
+    if (page.hadNikud) {
+      attempt = 'דף מנוקד – קורא את האותיות בלי הניקוד…';
+      const r = await run(best.canvas, true, best.psm, true);
+      if (r.score > best.score) best = r;
+    }
+    if (state.ocrLang === 'mix' && best.score >= MIN_GOOD_LETTERS) {
       const text = best.data.text || '';
       const he = (text.match(HEB_RE) || []).length;
       const en = (text.match(LAT_RE) || []).length;
@@ -777,7 +844,7 @@ async function recognizePage(page, { autoRotate = true } = {}) {
         attempt = 'משפר את הדיוק…';
         const w1 = await getWorker(single);
         await w1.setParameters({ tessedit_pageseg_mode: best.psm });
-        const { data } = await w1.recognize(best.pre ? preprocess(best.canvas) : best.canvas, {}, { blocks: true, text: true });
+        const { data } = await w1.recognize(prepare(best.canvas, best.pre, best.marks), {}, { blocks: true, text: true });
         const q = quality(data);
         if (q.score >= best.score * 0.9) best = { ...best, data, ...q };
       }
@@ -816,6 +883,8 @@ function openReaderFromPages() {
   $('#rotateBtn').hidden = !state.pages.length;
   render(text);
   showReader();
+  // הדף המקורי היה מנוקד – מציגים גם אותו מנוקד (בלי לשנות את ההעדפה של התלמיד)
+  if (state.pages.some((p) => p.hadNikud) && HAS_HEB.test(text)) applyNikud();
   if (!text.trim()) {
     $('#text').innerHTML = '<p>לא מצאנו טקסט בתמונה 🙁</p>'
       + '<p>נסו <b>↻ סיבוב וזיהוי מחדש</b>, או צלמו שוב: ישר מלמעלה, באור טוב ובלי צל.</p>';
