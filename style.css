@@ -213,6 +213,8 @@ main {
   cursor: pointer;
 }
 .chip:focus-within { outline: 3px solid var(--primary); }
+.chip.on { background: var(--primary); border-color: var(--primary); color: var(--primary-ink); }
+.chip:disabled { opacity: .7; cursor: progress; }
 .tap-hint { margin: 0 0 8px; }
 
 .reading {

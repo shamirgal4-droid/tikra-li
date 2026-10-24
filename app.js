@@ -41,7 +41,9 @@ const state = {
   fontSize: store.get('fontSize', 24),
   follow: store.get('follow', true),
   pages: [],       // { canvas, text } – לכל דף שצולם, בשביל סיבוב וזיהוי מחדש
-  text: '',
+  text: '',        // הטקסט שמוצג ומוקרא (אולי מנוקד)
+  plain: '',       // הטקסט המקורי, בלי ניקוד שהוספנו
+  nikudOn: false,
 };
 
 // ─── עזרים ───────────────────────────────────────────────────────────────────
@@ -115,10 +117,19 @@ function splitSentences(paragraph) {
   return merged.flatMap(splitLong);
 }
 
+// טקסט חדש (מזיהוי, הקלדה או הדף האחרון). מנקד אוטומטית אם התלמיד בחר בניקוד.
 function render(text) {
+  state.plain = text;
+  state.nikudOn = false;
+  renderDisplay(text);
+  updateNikudBtn();
+  if (store.get('nikud', false) && HAS_HEB.test(text)) applyNikud();
+}
+
+function renderDisplay(text) {
   pause();
   state.text = text;
-  store.set('lastText', text);
+  store.set('lastText', state.plain);
   const root = $('#text');
   root.textContent = '';
   state.sentences = [];
@@ -836,9 +847,169 @@ async function rotateLastPage() {
   openReaderFromPages();
 }
 
+
+// ─── ניקוד – נקדימון (קוד פתוח, MIT) רץ בתוך המכשיר עם ONNX Runtime ──────────
+// הטבלאות זהות לאלה של נקדימון (nakdimon/dataset.py, hebrew.py) – אסור לשנות סדר.
+
+const HAS_HEB = /[א-ת]/;
+const NQ_RAFE = 'ֿ';
+const range = (from, n) => Array.from({ length: n }, (_, i) => String.fromCharCode(from + i));
+const NQ_VALID = [' ', '!', '"', "'", '(', ')', ',', '-', '.', ':', ';', '?', ...range(0x05D0, 27)];
+const NQ_LETTERS = ['', 'H', 'O', '5', ...NQ_VALID];
+const NQ_NIQQUD = ['', NQ_RAFE, ...range(0x05B0, 13), 'ַ'];
+const NQ_DAGESH = ['', NQ_RAFE, 'ּ'];
+const NQ_SIN = ['', NQ_RAFE, 'ׁ', 'ׂ'];
+const NQ_MARKS = /[֑-ׇֽֿׁׂׅׄ]/g;
+const canDagesh = (c) => 'בגדהוזטיכלמנספצקשתךף'.includes(c);
+const canNiqqud = (c) => 'אבגדהוזחטיכלמנסעפצקרשתךן'.includes(c);
+
+function nqNormalize(c) {
+  if (NQ_VALID.includes(c)) return c;
+  if (c === '\n' || c === '\t') return ' ';
+  if ('־‒–—―−'.includes(c)) return '-';
+  if (c === '[') return '(';
+  if (c === ']') return ')';
+  if ('´‘’'.includes(c)) return "'";
+  if ('“”״'.includes(c)) return '"';
+  if (/\d/.test(c)) return '5';
+  if (c === '…') return ',';
+  if ('ײװױ'.includes(c)) return 'H';
+  return 'O';
+}
+
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src;
+    s.onload = resolve;
+    s.onerror = () => reject(new Error('לא נטען: ' + src));
+    document.head.append(s);
+  });
+}
+
+// מוריד את המודל עם התקדמות (פעם אחת – אחר כך מהמטמון)
+async function fetchWithProgress(url, onProgress) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`הורדה נכשלה (${res.status})`);
+  const total = Number(res.headers.get('content-length')) || 0;
+  if (!res.body || !total) return new Uint8Array(await res.arrayBuffer());
+  const reader = res.body.getReader();
+  const buf = new Uint8Array(total);
+  let got = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (got + value.length > buf.length) return new Uint8Array(await new Blob([buf.subarray(0, got), value]).arrayBuffer());
+    buf.set(value, got);
+    got += value.length;
+    onProgress(got / total);
+  }
+  return buf.subarray(0, got);
+}
+
+let nikudSession = null;
+function getNikud(onProgress) {
+  if (!nikudSession) {
+    nikudSession = (async () => {
+      if (typeof ort === 'undefined') await loadScript('vendor/ort/ort.wasm.min.js');
+      ort.env.wasm.wasmPaths = abs('vendor/ort/');
+      ort.env.wasm.numThreads = 1;
+      const model = await fetchWithProgress(abs('vendor/nakdimon/Nakdimon.onnx'), onProgress);
+      return ort.InferenceSession.create(model, { executionProviders: ['wasm'] });
+    })();
+    nikudSession.catch(() => { nikudSession = null; });
+  }
+  return nikudSession;
+}
+
+async function nikudParagraph(session, text) {
+  const chars = Array.from(text.replace(NQ_MARKS, ''));
+  if (!chars.some((c) => HAS_HEB.test(c))) return chars.join('');
+  const ids = Int32Array.from(chars, (c) => NQ_LETTERS.indexOf(nqNormalize(c)));
+  const out = await session.run({ input: new ort.Tensor('int32', ids, [1, ids.length]) });
+  const argmax = (t, i) => {
+    const k = t.dims[2];
+    let best = 0;
+    for (let j = 1; j < k; j++) if (t.data[i * k + j] > t.data[i * k + best]) best = j;
+    return best;
+  };
+  let res = '';
+  chars.forEach((c, i) => {
+    res += c;
+    if (canDagesh(c)) res += NQ_DAGESH[argmax(out.D, i)];
+    if (c === 'ש') res += NQ_SIN[argmax(out.S, i)];
+    if (canNiqqud(c)) res += NQ_NIQQUD[argmax(out.N, i)];
+  });
+  return res.split(NQ_RAFE).join('');
+}
+
+function updateNikudBtn() {
+  const btn = $('#nikudBtn');
+  btn.hidden = !HAS_HEB.test(state.plain);
+  btn.setAttribute('aria-pressed', String(state.nikudOn));
+  btn.classList.toggle('on', state.nikudOn);
+  btn.textContent = state.nikudOn ? 'בִּטּוּל נִקּוּד' : 'נִקּוּד';
+}
+
+let nikudBusy = false;
+async function applyNikud() {
+  if (nikudBusy) return;
+  nikudBusy = true;
+  const source = state.plain;
+  const btn = $('#nikudBtn');
+  btn.disabled = true;
+  btn.textContent = 'מנקד…';
+  try {
+    const session = await getNikud((p) => { btn.textContent = `מוריד נקדן… ${Math.round(p * 100)}%`; });
+    btn.textContent = 'מנקד…';
+    const paras = [];
+    for (const para of source.split('\n')) paras.push(await nikudParagraph(session, para));
+    if (state.plain === source) {
+      state.nikudOn = true;
+      renderDisplay(paras.join('\n'));
+    }
+  } catch (err) {
+    console.error(err);
+    toast(`הניקוד לא הצליח. בדקו חיבור לאינטרנט ונסו שוב. (${String(err?.message || err).slice(0, 60)})`, 6000);
+  } finally {
+    nikudBusy = false;
+    btn.disabled = false;
+    updateNikudBtn();
+  }
+}
+
+function toggleNikud() {
+  if (state.nikudOn) {
+    state.nikudOn = false;
+    store.set('nikud', false);
+    renderDisplay(state.plain);
+    updateNikudBtn();
+  } else {
+    store.set('nikud', true);
+    applyNikud();
+  }
+}
+
+// ─── תרגום – ב-Google Translate (רק כשלוחצים, ורק הטקסט – לא התמונה) ─────────
+
+function translateText() {
+  const text = state.plain.trim();
+  if (!text) return;
+  if (!store.get('translateOk', false)) {
+    const ok = window.confirm('התרגום נעשה באתר Google Translate.\nהטקסט (לא התמונה) יישלח לגוגל לתרגום.\n\nלהמשיך?');
+    if (!ok) return;
+    store.set('translateOk', true);
+  }
+  const he = (text.match(HEB_RE) || []).length;
+  const en = (text.match(LAT_RE) || []).length;
+  const [sl, tl] = he >= en ? ['iw', 'en'] : ['en', 'iw'];
+  const url = `https://translate.google.com/?sl=${sl}&tl=${tl}&op=translate&text=${encodeURIComponent(text.slice(0, 4500))}`;
+  window.open(url, '_blank', 'noopener');
+}
+
 // ─── עריכה ───────────────────────────────────────────────────────────────────
 
-function openEditor(initial = state.text) {
+function openEditor(initial = state.plain) {
   pause();
   $('#editArea').value = initial;
   $('#editor').hidden = false;
@@ -936,6 +1107,8 @@ function init() {
   });
 
   $('#editBtn').addEventListener('click', () => openEditor());
+  $('#nikudBtn').addEventListener('click', toggleNikud);
+  $('#translateBtn').addEventListener('click', translateText);
   $('#editDone').addEventListener('click', () => closeEditor(true));
   $('#editCancel').addEventListener('click', () => closeEditor(false));
   $('#rotateBtn').addEventListener('click', rotateLastPage);
