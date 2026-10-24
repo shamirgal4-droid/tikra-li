@@ -37,7 +37,7 @@ const state = {
   playing: false,
   gen: 0,          // עולה בכל עצירה/התחלה, כדי להתעלם מאירועים של הקראה ישנה
   rate: clampRate(store.get('rate', 1)),
-  ocrLang: store.get('ocrLang', 'heb'),
+  ocrLang: store.get('ocrLang2', 'mix'),
   fontSize: store.get('fontSize', 24),
   follow: store.get('follow', true),
   pages: [],       // { canvas, text } – לכל דף שצולם, בשביל סיבוב וזיהוי מחדש
@@ -390,12 +390,13 @@ function setRate(r) {
 // ─── זיהוי טקסט (OCR) ─────────────────────────────────────────────────────────
 
 const OCR_LANGS = { heb: ['heb'], eng: ['eng'], mix: ['heb', 'eng'] };
+const PSM_AUTO = '3';    // פריסה אוטומטית – ברירת המחדל של tesseract.js היא "גוש אחד", שנכשל בטבלאות
+const PSM_SPARSE = '11'; // מילים מפוזרות – לטבלאות ורשימות
 let workerPromise = null;
 let workerLangs = '';
 let onOcrProgress = null;
 
-function getWorker() {
-  const langs = OCR_LANGS[state.ocrLang] || OCR_LANGS.heb;
+function getWorker(langs = OCR_LANGS[state.ocrLang] || OCR_LANGS.mix) {
   if (!workerPromise) {
     workerLangs = langs.join('+');
     workerPromise = Tesseract.createWorker(langs, 1, {
@@ -536,8 +537,52 @@ function preprocess(src) {
     d[p] = d[p + 1] = d[p + 2] = v;
     d[p + 3] = 255;
   }
+  removeLines(d, w, h);
   ctx.putImageData(img, 0, 0);
   return c;
+}
+
+// מוחק קווים ארוכים (טבלאות, שורות למילוי, קו תחתון) – הם מבלבלים את זיהוי הפריסה.
+// קו = ריצה כהה רציפה ארוכה בהרבה מגובה של אות.
+function removeLines(d, w, h) {
+  const dark = (i) => d[i * 4] < 128;
+  const kill = new Uint8Array(w * h);
+  const minH = Math.max(60, w * 0.12);
+  const minV = Math.max(60, h * 0.035);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w;) {
+      if (!dark(y * w + x)) { x++; continue; }
+      let e = x;
+      while (e < w && dark(y * w + e)) e++;
+      if (e - x >= minH) for (let k = x; k < e; k++) kill[y * w + k] = 1;
+      x = e;
+    }
+  }
+  for (let x = 0; x < w; x++) {
+    for (let y = 0; y < h;) {
+      if (!dark(y * w + x)) { y++; continue; }
+      let e = y;
+      while (e < h && dark(e * w + x)) e++;
+      if (e - y >= minV) for (let k = y; k < e; k++) kill[k * w + x] = 1;
+      y = e;
+    }
+  }
+  // מוחקים גם פיקסל אחד מסביב – קווים בצילום הם מטושטשים בשוליים
+  for (let i = 0; i < kill.length; i++) {
+    if (!kill[i]) continue;
+    const x = i % w;
+    const y = (i - x) / w;
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const xx = x + dx;
+        const yy = y + dy;
+        if (xx >= 0 && xx < w && yy >= 0 && yy < h) {
+          const p = (yy * w + xx) * 4;
+          d[p] = d[p + 1] = d[p + 2] = 255;
+        }
+      }
+    }
+  }
 }
 
 function meaningful(line) {
@@ -550,12 +595,20 @@ function meaningful(line) {
 const BIDI_MARKS = /[‎‏‪-‮⁦-⁩]/g;
 const FILL_LINES = /_{2,}|\.{4,}|…{2,}/g;   // שורות ריקות למילוי בדפי עבודה
 const MIN_EDGE_CONF = 45;  // "מילים" לא בטוחות בקצה שורה הן כמעט תמיד לכלוך/צל
-const MIN_LINE_CONF = 40;
 const LIST_ITEM = /^(?:\d{1,2}[.)]?|[א-ת][.)]|[•●▪◦*\-–])\s/;  // 1. / א. / • – כל סעיף בשורה משלו
 
+const QUOTES = /['"“”„‘’`]/;
 function cleanWord(text) {
-  return text.replace(BIDI_MARKS, '').replace(/[|¦]/g, '').replace(FILL_LINES, '').trim();
+  let t = text.replace(BIDI_MARKS, '').replace(/[|¦]/g, '').replace(FILL_LINES, '').trim();
+  if (!/[\p{L}\p{N}]/u.test(t)) return /^[.,!?;:…-]+$/.test(t) ? t : '';
+  // מרכאה פותחת בלי סוגרת היא כמעט תמיד שארית של קו או לכלוך
+  if (QUOTES.test(t[0]) && !QUOTES.test(t[t.length - 1])) t = t.slice(1);
+  return t;
 }
+
+// מילה "אמיתית" בקצה שורה: רק אותיות של שפה אחת, באורך סביר
+const REAL_WORD = /^(?:[\u05D0-\u05EA]{3,}|[A-Za-z]{3,})[.,!?:;]?$/;
+const keepEdge = (w) => w.confidence >= MIN_EDGE_CONF || (w.confidence >= 25 && REAL_WORD.test(w.text));
 
 // בונה טקסט מהמבנה של Tesseract: מסנן רעש, מחבר שורות לפסקאות
 // ושומר כותרות ושורות קצרות כפסקה נפרדת (כדי שלא יוקראו כהמשך של המשפט הבא)
@@ -566,12 +619,11 @@ function ocrToText(data) {
     for (const para of block.paragraphs || []) {
       const lines = [];
       for (const line of para.lines || []) {
-        if (line.confidence < MIN_LINE_CONF) continue;
         const words = line.words.slice();
-        while (words.length && words[0].confidence < MIN_EDGE_CONF) words.shift();
-        while (words.length && words[words.length - 1].confidence < MIN_EDGE_CONF) words.pop();
+        while (words.length && !keepEdge(words[0])) words.shift();
+        while (words.length && !keepEdge(words[words.length - 1])) words.pop();
         const text = words.map((w) => cleanWord(w.text)).filter(Boolean).join(' ');
-        if (meaningful(text)) lines.push({ text, width: line.bbox.x1 - line.bbox.x0 });
+        if (meaningful(text)) lines.push({ text, words: words.length, width: line.bbox.x1 - line.bbox.x0 });
       }
       if (!lines.length) continue;
       const maxWidth = Math.max(...lines.map((l) => l.width));
@@ -583,7 +635,8 @@ function ocrToText(data) {
         }
         if (/[A-Za-z]-$/.test(cur)) cur = cur.slice(0, -1) + l.text;
         else cur += (cur ? ' ' : '') + l.text;
-        if (l.width < maxWidth * 0.75) { paras.push(cur); cur = ''; }
+        // שורה קצרה (סוף פסקה, כותרת, תא בטבלה, פריט ברשימה) – לא ממשיכה לשורה הבאה
+        if (l.width < maxWidth * 0.75 || l.words <= 3) { paras.push(cur); cur = ''; }
       }
       if (cur) paras.push(cur);
     }
@@ -612,21 +665,29 @@ function cleanOcr(text) {
     .join('\n');
 }
 
-// כמה אותיות זוהו בביטחון גבוה – כך בוחרים את הניסיון הטוב ביותר
-const GOOD_ENOUGH = 40;
-function confidentLetters(data) {
-  let n = 0;
+// איכות זיהוי: כמה אותיות זוהו בביטחון גבוה (להשוואה בין ניסיונות),
+// וביטחון ממוצע לאות (דף הפוך נותן "מילים" רבות בביטחון נמוך)
+const MIN_GOOD_LETTERS = 40;
+const MIN_GOOD_CONF = 70;
+function quality(data) {
+  let score = 0;
+  let letters = 0;
+  let confSum = 0;
   for (const block of data.blocks || []) {
     for (const para of block.paragraphs || []) {
       for (const line of para.lines || []) {
         for (const w of line.words || []) {
-          if (w.confidence >= 60) n += (w.text.match(/[\p{L}\p{N}]/gu) || []).length;
+          const n = (w.text.match(/[\p{L}\p{N}]/gu) || []).length;
+          letters += n;
+          confSum += n * w.confidence;
+          if (w.confidence >= 60) score += n;
         }
       }
     }
   }
-  return n;
+  return { score, conf: letters ? confSum / letters : 0 };
 }
+const isGood = (r) => r.score >= MIN_GOOD_LETTERS && r.conf >= MIN_GOOD_CONF;
 
 function showPreview(canvas) {
   const preview = $('#preview');
@@ -657,28 +718,56 @@ async function recognizePage(page, { autoRotate = true } = {}) {
   };
 
   try {
-    const worker = await getWorker();
+    let worker = await getWorker();
     hint.textContent = '';
-    const run = async (canvas, pre) => {
+    const run = async (canvas, pre, psm = PSM_AUTO) => {
+      await worker.setParameters({ tessedit_pageseg_mode: psm });
       const { data } = await worker.recognize(pre ? preprocess(canvas) : canvas, {}, { blocks: true, text: true });
-      return { data, canvas, score: confidentLetters(data) };
+      return { data, canvas, pre, psm, ...quality(data) };
     };
 
     let best = await run(page.canvas, true);
-    if (best.score < GOOD_ENOUGH) {
+    if (!isGood(best)) {
       attempt = 'מנסה שוב בדרך אחרת…';
-      const plain = await run(page.canvas, false);
-      if (plain.score > best.score) best = plain;
+      for (const [pre, psm] of [[true, PSM_SPARSE], [false, PSM_AUTO]]) {
+        const r = await run(page.canvas, pre, psm);
+        if (r.score > best.score) best = r;
+        if (isGood(best)) break;
+      }
     }
-    if (autoRotate && best.score < GOOD_ENOUGH) {
-      let c = page.canvas;
-      for (let k = 1; k <= 3 && best.score < GOOD_ENOUGH; k++) {
-        c = rotateCanvas(c);
-        attempt = `מנסה לסובב את התמונה (${k}/3)…`;
-        hint.textContent = 'נראה שהתמונה הפוכה או על הצד – מחפשים את הכיוון הנכון.';
+    if (!isGood(best) && state.ocrLang !== 'mix') {
+      // אולי נבחרה שפה לא נכונה (למשל English על דף בעברית) – מנסים עם שתי השפות
+      attempt = 'מנסה עם עברית ואנגלית…';
+      worker = await getWorker(OCR_LANGS.mix);
+      const r = await run(page.canvas, true);
+      if (r.score > best.score) best = r;
+    }
+    if (autoRotate && !isGood(best)) {
+      // דף הפוך הוא המקרה הנפוץ (על הצד Tesseract מזהה לבד) – מנסים אותו ראשון
+      const r90 = rotateCanvas(page.canvas);
+      const r180 = rotateCanvas(r90);
+      const r270 = rotateCanvas(r180);
+      hint.textContent = 'נראה שהתמונה הפוכה או על הצד – מחפשים את הכיוון הנכון.';
+      for (const [k, c] of [r180, r90, r270].entries()) {
+        attempt = `מנסה לסובב את התמונה (${k + 1}/3)…`;
         showPreview(c);
         const r = await run(c, true);
         if (r.score > best.score) best = r;
+        if (isGood(best)) break;
+      }
+    }
+    if (state.ocrLang === 'mix' && isGood(best)) {
+      const text = best.data.text || '';
+      const he = (text.match(HEB_RE) || []).length;
+      const en = (text.match(LAT_RE) || []).length;
+      const single = he >= (he + en) * 0.9 ? ['heb'] : en >= (he + en) * 0.9 ? ['eng'] : null;
+      if (single) {
+        attempt = 'משפר את הדיוק…';
+        const w1 = await getWorker(single);
+        await w1.setParameters({ tessedit_pageseg_mode: best.psm });
+        const { data } = await w1.recognize(best.pre ? preprocess(best.canvas) : best.canvas, {}, { blocks: true, text: true });
+        const q = quality(data);
+        if (q.score >= best.score * 0.9) best = { ...best, data, ...q };
       }
     }
     page.canvas = best.canvas;
@@ -811,7 +900,7 @@ function init() {
 
   for (const r of $$('input[name="ocrLang"]')) {
     r.checked = r.value === state.ocrLang;
-    r.addEventListener('change', () => { state.ocrLang = r.value; store.set('ocrLang', r.value); });
+    r.addEventListener('change', () => { state.ocrLang = r.value; store.set('ocrLang2', r.value); });
   }
 
   const startWarmup = () => { if (typeof Tesseract !== 'undefined') getWorker().catch(() => {}); };
