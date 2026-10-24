@@ -612,36 +612,81 @@ function cleanOcr(text) {
     .join('\n');
 }
 
-async function recognizeCanvas(canvas) {
+// כמה אותיות זוהו בביטחון גבוה – כך בוחרים את הניסיון הטוב ביותר
+const GOOD_ENOUGH = 40;
+function confidentLetters(data) {
+  let n = 0;
+  for (const block of data.blocks || []) {
+    for (const para of block.paragraphs || []) {
+      for (const line of para.lines || []) {
+        for (const w of line.words || []) {
+          if (w.confidence >= 60) n += (w.text.match(/[\p{L}\p{N}]/gu) || []).length;
+        }
+      }
+    }
+  }
+  return n;
+}
+
+function showPreview(canvas) {
   const preview = $('#preview');
-  const maxW = 900;
-  const s = Math.min(1, maxW / canvas.width);
+  const s = Math.min(1, 900 / canvas.width);
   preview.width = Math.round(canvas.width * s);
   preview.height = Math.round(canvas.height * s);
   preview.getContext('2d').drawImage(canvas, 0, 0, preview.width, preview.height);
+}
 
+// מזהה דף. אם הניסיון הראשון חלש: מנסה בלי עיבוד מקדים, ואז בכל הכיוונים
+// (טלפונים שומרים לפעמים תמונה על הצד). הכיוון הטוב נשמר בדף.
+async function recognizePage(page, { autoRotate = true } = {}) {
+  showPreview(page.canvas);
   const bar = $('#workBar');
   const label = $('#workText');
   const hint = $('#workHint');
+  let attempt = 'מזהה טקסט…';
   bar.style.width = '3%';
   label.textContent = 'מכין את מנוע הזיהוי…';
   hint.textContent = 'בפעם הראשונה זה לוקח קצת יותר זמן. אחר כך זה מהיר יותר ועובד גם בלי אינטרנט.';
   onOcrProgress = (m) => {
     if (m.status === 'recognizing text') {
-      label.textContent = `מזהה טקסט… ${Math.round(m.progress * 100)}%`;
+      label.textContent = `${attempt} ${Math.round(m.progress * 100)}%`;
       bar.style.width = `${10 + m.progress * 90}%`;
-      hint.textContent = '';
     } else if (/loading/.test(m.status)) {
       bar.style.width = `${3 + (m.progress || 0) * 7}%`;
     }
   };
 
-  const worker = await getWorker();
-  label.textContent = 'מזהה טקסט…';
-  const prepared = preprocess(canvas);
-  const { data } = await worker.recognize(prepared, {}, { blocks: true, text: true });
-  onOcrProgress = null;
-  return ocrToText(data);
+  try {
+    const worker = await getWorker();
+    hint.textContent = '';
+    const run = async (canvas, pre) => {
+      const { data } = await worker.recognize(pre ? preprocess(canvas) : canvas, {}, { blocks: true, text: true });
+      return { data, canvas, score: confidentLetters(data) };
+    };
+
+    let best = await run(page.canvas, true);
+    if (best.score < GOOD_ENOUGH) {
+      attempt = 'מנסה שוב בדרך אחרת…';
+      const plain = await run(page.canvas, false);
+      if (plain.score > best.score) best = plain;
+    }
+    if (autoRotate && best.score < GOOD_ENOUGH) {
+      let c = page.canvas;
+      for (let k = 1; k <= 3 && best.score < GOOD_ENOUGH; k++) {
+        c = rotateCanvas(c);
+        attempt = `מנסה לסובב את התמונה (${k}/3)…`;
+        hint.textContent = 'נראה שהתמונה הפוכה או על הצד – מחפשים את הכיוון הנכון.';
+        showPreview(c);
+        const r = await run(c, true);
+        if (r.score > best.score) best = r;
+      }
+    }
+    page.canvas = best.canvas;
+    // אם הסינון הקפדני מחק הכל – עדיף טקסט עם קצת רעש מאשר כלום
+    return ocrToText(best.data) || cleanOcr(best.data.text || '');
+  } finally {
+    onOcrProgress = null;
+  }
 }
 
 async function handleFiles(files, { append = false } = {}) {
@@ -655,12 +700,12 @@ async function handleFiles(files, { append = false } = {}) {
       const canvas = await fileToCanvas(file);
       const page = { canvas, text: '' };
       state.pages.push(page);
-      page.text = await recognizeCanvas(canvas);
+      page.text = await recognizePage(page);
     }
     openReaderFromPages();
   } catch (err) {
     console.error(err);
-    toast('משהו השתבש בזיהוי. נסו שוב, או צלמו מחדש.');
+    toast(`משהו השתבש בזיהוי. נסו שוב, או צלמו מחדש. (${String(err?.message || err).slice(0, 80)})`, 8000);
     show(state.text ? 'reader' : 'home');
   }
 }
@@ -693,7 +738,7 @@ async function rotateLastPage() {
   page.canvas = rotateCanvas(page.canvas);
   show('work');
   try {
-    page.text = await recognizeCanvas(page.canvas);
+    page.text = await recognizePage(page, { autoRotate: false });
   } catch (err) {
     console.error(err);
     toast('משהו השתבש בזיהוי. נסו שוב.');
